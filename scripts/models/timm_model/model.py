@@ -10,12 +10,12 @@ class TimmModel(nn.Module):
             model_name = cfg.TIMM_BASE_MODEL,
             pretrained = True,
             num_classes = 0,
-            global_pool = "avg",
         )
+
         self.grid = cfg.GRID
         self.device = cfg.DEVICE
         self.drop_out = cfg.DROPOUT
-        self.n_outputs = cfg.N_OUTPUTS
+        self.n_outputs = cfg.NUM_CLASSES
         self.tile_size, self.num_feats = self._get_model_info()
         print(f"[INFO] Using {cfg.TIMM_BASE_MODEL} | tile_size: {self.tile_size} | num_feats: {self.num_feats}")
 
@@ -65,7 +65,8 @@ class TimmModel(nn.Module):
                 img_size = int(ins if isinstance(ins, (int, float)) else 224)
 
         name = getattr(self.backbone, "default_cfg", {}).get("architecture", "") or str(type(self.backbone))
-        img_size = 518 if ("dinov2" in name.lower()) else 224
+        if img_size is None:
+            img_size = 518 if ("dinov2" in name.lower()) else 224
         
         return img_size, num_features
     
@@ -123,5 +124,5 @@ class TimmModel(nn.Module):
         return torch.stack(outs, dim = 1)
 
 if __name__ == "__main__":
-    models = timm.list_models(filter = "*dinov3*")
+    models = timm.list_models(filter = "*dinov*")
     print(models)

@@ -34,12 +34,12 @@ class Config:
     DEPTH = 1 # num of transformer blocks
 
     N_SPLITS = 5
-    EPOCHS = 10
+    EPOCHS = 50
     BATCH = 4
     LR = 1e-4
 
     NUM_WORKERS = 16
-    VAL_WORKERS = 8
+    VAL_WORKERS = 16
 
     TRAIN_CSV = "dataset/train_df.csv"
     IMG_DIR = "."
@@ -49,7 +49,6 @@ class Config:
     IN_CHANNELS = 3
     GRID = (2, 2)
     DROPOUT = 0.2
-    N_OUTPUTS = 3
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -58,7 +57,7 @@ class Config:
         timm_model = TimmModel,
     )
     MODEL = "timm_model"
-    TIMM_BASE_MODEL = "vit_base_patch16_dinov3.lvd1689m"
+    TIMM_BASE_MODEL = 'vit_base_patch16_dinov3.lvd1689m'
 
     @classmethod
     def to_dict(cls):
@@ -140,8 +139,8 @@ class CSIRODataset(Dataset):
     def get_n_patches(self, image, rows, cols):
         width, height = image.size
 
-        tile_width = width / 4
-        tile_height = height / 2
+        tile_width = width // cols
+        tile_height = height // rows
 
         patches = []
         for r in range(rows):
@@ -205,7 +204,7 @@ class Runner:
 
         self.df["strata"] = make_multitarget_strata(
             self.df,
-            cols=["Dry_Total_g"],
+            cols=["Dry_Green_g", "Dry_Dead_g", "Dry_Total_g"],
             n_bins=4,
             n_splits=Config.N_SPLITS,
         )
@@ -276,7 +275,7 @@ class Runner:
                     scaler = torch.amp.GradScaler(device = Config.DEVICE)
 
                     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer, mode='max', factor=0.5, patience=5
+                        optimizer, mode='min', factor=0.5, patience=5
                     )
                     best_comp_score = float('-inf')
                     best_ckpt_path = os.path.join(self.exp_dir, f"best_model_fold{fold+1}.pth")
@@ -342,7 +341,7 @@ class Runner:
                         # ===== LR Decay + ModelCheckpointing =====
                         current_lr = optimizer.param_groups[0]['lr']
                         mlflow.log_metric("lr", current_lr, step=epoch)
-                        scheduler.step(val_comp_score)
+                        scheduler.step(val_loss_mean)
 
                         # Checkpointing: if best comp score so far, save
                         if val_comp_score > best_comp_score:
