@@ -21,7 +21,7 @@ class TimmModel(nn.Module):
 
         self.heads = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(self.num_feats, 256),
+                nn.Linear(self.num_feats * 4, 256),
                 nn.ReLU(inplace=True),
                 nn.Dropout(self.drop_out),
                 nn.Linear(256, 1)
@@ -30,7 +30,7 @@ class TimmModel(nn.Module):
         ])
         self.softplus = nn.Softplus(beta=1.0)
         self.grid_dim = (2, 2)
-        self.query = nn.Parameter(torch.randn(self.num_feats))
+        # self.query = nn.Parameter(torch.randn(self.num_feats))
 
         # initializing weights
         self._init_weights()
@@ -106,18 +106,23 @@ class TimmModel(nn.Module):
         feats_l = self._tile_and_embed(left)
         feats_r = self._tile_and_embed(right)
 
+        pooled_l = feats_l.mean(dim = 1)
+        pooled_r = feats_r.mean(dim = 1)
 
-        feats = torch.cat([feats_l, feats_r], dim=1) 
+        diff = torch.abs(pooled_l - pooled_r)
+        prod = pooled_l * pooled_r
+        feats = torch.cat([pooled_l, pooled_r, diff, prod], dim=1)
 
-        B, T, D = feats.shape
-        q = self.query.unsqueeze(0).unsqueeze(1).expand(B, -1, -1)  # (B,1,D)
-        attn_scores = (q * feats).sum(dim=-1, keepdim=True)         # (B, T, 1)
-        attn_weights = torch.softmax(attn_scores, dim=1)           # (B, T, 1)
-        pooled = (feats * attn_weights).sum(dim=1)  
+        # feats = torch.cat([feats_l, feats_r], dim=1) 
+        # B, T, D = feats.shape
+        # q = self.query.unsqueeze(0).unsqueeze(1).expand(B, -1, -1)  # (B,1,D)
+        # attn_scores = (q * feats).sum(dim=-1, keepdim=True)         # (B, T, 1)
+        # attn_weights = torch.softmax(attn_scores, dim=1)           # (B, T, 1)
+        # pooled = (feats * attn_weights).sum(dim=1)  
         
         outs = [
             self.softplus(
-                head(pooled).squeeze(1)
+                head(feats).squeeze(1)
             ) 
             for head in self.heads
         ]

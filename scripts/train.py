@@ -11,20 +11,24 @@ import json
 import inspect
 import mlflow
 import mlflow.pytorch
-from metrics import competition_metric
-from data_split import make_multitarget_strata
+from metrics import competition_metric, competition_metric_for_pred3
+from data_split import make_multitarget_strata, make_state_date_stratified_group_folds
 from warnings import filterwarnings 
 import random
 import numpy as np
 from datetime import datetime
-from loss_functions import WeightedRMSELoss
+from loss_functions import WeightedRMSELoss, CSIROMultiTaskLoss
 from utils import log_model_results
 from mlflow.models import infer_signature
 from models.timm_model.model import TimmModel
 from models.vit_0.model import VitTransformer
+from pathlib import Path
+from sklearn.model_selection import StratifiedGroupKFold
 
 filterwarnings("ignore")
 
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 class Config:
     IMG_SIZE = 1000
@@ -34,7 +38,7 @@ class Config:
     DEPTH = 1 # num of transformer blocks
 
     N_SPLITS = 5
-    EPOCHS = 50
+    EPOCHS = 20
     BATCH = 4
     LR = 1e-4
 
@@ -45,7 +49,6 @@ class Config:
     IMG_DIR = "."
     SEED = 42
 
-    NUM_CLASSES = 3
     IN_CHANNELS = 3
     GRID = (2, 2)
     DROPOUT = 0.2
@@ -58,6 +61,16 @@ class Config:
     )
     MODEL = "timm_model"
     TIMM_BASE_MODEL = 'vit_base_patch16_dinov3.lvd1689m'
+    TARGET_COLS = [
+        "Dry_Green_g",
+        "Dry_Dead_g",
+        "Dry_Clover_g",
+        "GDM_g",
+        "Dry_Total_g",
+        "Pre_GSHH_NDVI",
+        "Height_Ave_cm",
+    ]
+    NUM_CLASSES = len(TARGET_COLS)
 
     @classmethod
     def to_dict(cls):
@@ -95,7 +108,7 @@ class CSIRODataset(Dataset):
     """
     Returns:
         image: Tensor (C, H, W)
-        targets: Tensor (3,) -> ["Dry_Total_g", "GDM_g", "Dry_Green_g"]
+        targets: Tensor (3,) -> Config.TARGET_COLS
     """
     def __init__(self, df, img_dir=".", is_train: bool = True):
         self.df = df.reset_index(drop=True)
@@ -103,7 +116,7 @@ class CSIRODataset(Dataset):
         self.is_train = is_train
 
         # order must match model outputs
-        self.base_cols = ["Dry_Total_g", "GDM_g", "Dry_Green_g"] # Ordering is important
+        self.base_cols = Config.TARGET_COLS # Ordering is important
 
         if self.is_train:
             self.transform = transforms.Compose([
@@ -192,21 +205,16 @@ class Runner:
 
         # Initiailizing configs
         self.df = pd.read_csv(Config.TRAIN_CSV)
-        self.target_cols = [
-            "Dry_Green_g",
-            "Dry_Dead_g",
-            "Dry_Clover_g",
-            "GDM_g",
-            "Dry_Total_g",
-        ]
+        self.target_cols = Config.TARGET_COLS
         for c in self.target_cols:
             self.df[c] = pd.to_numeric(self.df[c], errors="coerce")
 
-        self.df["strata"] = make_multitarget_strata(
+        self.df = make_state_date_stratified_group_folds(
             self.df,
-            cols=["Dry_Green_g", "Dry_Dead_g", "Dry_Total_g"],
-            n_bins=4,
+            seed = Config.SEED,
             n_splits=Config.N_SPLITS,
+            state_col="State",
+            date_col="Sampling_Date",
         )
 
     def run(self):
@@ -225,17 +233,11 @@ class Runner:
             script_path = inspect.getfile(Runner)
             mlflow.log_artifact(script_path)
 
-            skf = StratifiedKFold(
-                n_splits=Config.N_SPLITS,
-                shuffle=True,
-                random_state=Config.SEED,
-            )
+            for fold in range(Config.N_SPLITS):
+                train_df = self.df[self.df["fold"] != fold].reset_index(drop = True)
+                val_df = self.df[self.df["fold"] == fold].reset_index(drop = True)
 
-            for fold, (tr, va) in enumerate(skf.split(self.df, self.df["strata"])):
                 print(f"\n========== Fold {fold+1}/{Config.N_SPLITS} ==========")
-
-                train_df = self.df.iloc[tr].reset_index(drop=True)
-                val_df   = self.df.iloc[va].reset_index(drop=True)
 
                 with mlflow.start_run(
                     run_name = f"{self.run_name}_fold{fold + 1}",
@@ -270,8 +272,15 @@ class Runner:
                     model = Config.MODEL_MAP[Config.MODEL](Config).to(Config.DEVICE, )
                     optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR)
 
-                    loss_weights = [0.5, 0.2, 0.1]
-                    loss_fn = WeightedRMSELoss(weights=loss_weights).to(Config.DEVICE)
+                    # loss_weights = [0.5, 0.2, 0.1]
+                    # loss_fn = WeightedRMSELoss(weights=loss_weights).to(Config.DEVICE)
+
+
+                    loss_fn = CSIROMultiTaskLoss(
+                        biomass_weights=[0.1, 0.1, 0.1, 0.2, 0.5],
+                        aux_ndvi_weight=0.1,
+                        aux_height_weight=0.1,
+                    ).to(Config.DEVICE)
                     scaler = torch.amp.GradScaler(device = Config.DEVICE)
 
                     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -296,7 +305,8 @@ class Runner:
 
                             with torch.amp.autocast(device_type = Config.DEVICE):
                                 preds = model(left, right)  # (B, 3)
-                                loss = loss_fn(preds, targets)
+                                # loss = loss_fn(preds, targets)
+                                loss, loss_dict = loss_fn(preds, targets)
 
                             scaler.scale(loss).backward()
                             scaler.step(optimizer)
@@ -306,7 +316,7 @@ class Runner:
 
                         train_loss_mean = total_loss / len(train_loader)
                         mlflow.log_metric("train_loss_mean", train_loss_mean, step=epoch)
-                        print(f"train_loss_mean (3 targets): {train_loss_mean:.4f}")
+                        print(f"train_loss_mean ({Config.NUM_CLASSES} targets): {train_loss_mean:.4f}")
 
                         # ================= VALIDATION ==================
                         model.eval()
@@ -319,22 +329,26 @@ class Runner:
                                 targets = targets.to(Config.DEVICE, non_blocking=True)
 
                                 preds = model(left, right)  # (B, 3)
+
                                 all_val_preds.append(preds.detach().cpu())
-                                vloss += loss_fn(preds, targets).item()
+                                loss, loss_dict = loss_fn(preds, targets)
+                                vloss += loss.item()
 
                         val_loss_mean = vloss / len(val_loader)
                         mlflow.log_metric("val_loss_mean", val_loss_mean, step=epoch)
-                        print(f"val_loss_mean (3 targets): {val_loss_mean:.4f}")
+                        print(f"val_loss_mean ({Config.NUM_CLASSES} targets): {val_loss_mean:.4f}")
 
                         # ===== COMPETITION METRIC =====
-                        preds_3 = torch.cat(all_val_preds, dim=0)
+                        preds_all = torch.cat(all_val_preds, dim=0)
 
                         # GT for all 5 targets in this fold, same row order as val_df
-                        targets_5 = torch.tensor(
+                        all_targets = torch.tensor(
                             val_df[self.target_cols].values, dtype=torch.float32
                         )
 
-                        val_comp_score = competition_metric(preds_3, targets_5)
+                        preds_5   = preds_all[:, :5]
+                        targets_5 = all_targets[:, :5]
+                        val_comp_score = competition_metric(preds_5, targets_5)
                         mlflow.log_metric("val_competition_metric", val_comp_score, step=epoch)
                         print(f"Val competition metric: {val_comp_score:.4f}")
 
@@ -383,7 +397,7 @@ class Runner:
                         mlflow_instance=mlflow,
                         train_preds = train_preds,
                         val_preds = val_preds,
-                        target_cols = ["Dry_Total_g", "GDM_g", "Dry_Green_g"],
+                        target_cols = Config.TARGET_COLS,
                         train_df = train_df,
                         val_df = val_df,
                         exp_dir = self.exp_dir,
@@ -422,6 +436,11 @@ class Runner:
                         signature = signature
                     )
 
+
+            for py_file in SCRIPT_DIR.rglob("*.py"):
+                rel = py_file.relative_to(SCRIPT_DIR).parent
+                artifact_subdir = str(Path("scripts") / rel)
+                mlflow.log_artifact(str(py_file), artifact_path=artifact_subdir)
 
 if __name__ == "__main__":
     Runner().run()
