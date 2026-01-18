@@ -136,6 +136,16 @@ class Dinov3MultiReg(nn.Module):
             nn.Softplus()
         )
     
+    def _encode_tokens(self, x):
+        """
+        Returns token embeddings of shape (B, T, D)
+        """
+        if self.use_timm:
+            # timm returns (B, T, D) with global_pool=""
+            return self.encoder(x)
+        else:
+            return self.encoder(pixel_values=x).last_hidden_state
+    
     def forward(self, x):
         """
         x must be a tuple: (left, right)
@@ -146,34 +156,21 @@ class Dinov3MultiReg(nn.Module):
         if not isinstance(x, tuple) or len(x) != 2:
             raise ValueError("Input should be (left_half, right_half)")
 
-        left, right = x  # each: (B, 3, H, W)
+        left, right = x  # (B,3,H,W)
 
-        # Transformer outputs:
-        # last_hidden_state: (B, T, D)
-        #   - T = number of tokens = 1 (CLS) + num_patches (+ maybe register tokens)
-        #   - D = hidden size
-        x_l = self.encoder(pixel_values=left).last_hidden_state   # (B, T, D)
-        x_r = self.encoder(pixel_values=right).last_hidden_state  # (B, T, D)
+        x_l = self._encode_tokens(left)   # (B,T,D)
+        x_r = self._encode_tokens(right)  # (B,T,D)
 
-        # Concatenate tokens from left and right along token axis
-        x_cat = torch.cat([x_l, x_r], dim=1)  # (B, 2T, D)
+        x_cat = torch.cat([x_l, x_r], dim=1)      # (B,2T,D)
+        x_fused = self.fusion(x_cat)              # (B,2T,D)
 
-        # Token fusion / local mixing
-        x_fused = self.fusion(x_cat)  # (B, 2T, D)
+        x_pool = self.pool(x_fused.transpose(1, 2)).flatten(1)  # (B,D)
 
-        # Pool over token dimension to get a single vector per sample
-        # pool expects (B, C, L), so transpose: (B, D, 2T)
-        x_pool = self.pool(x_fused.transpose(1, 2))  # (B, D, 1)
-        x_pool = x_pool.flatten(1)                   # (B, D)
+        # heads -> (B,1) each
+        green  = self.head_green(x_pool)
+        dead   = self.head_dead(x_pool)
+        clover = self.head_clover(x_pool)
 
-        # Heads
-        green  = self.head_green(x_pool)   # (B, 1)
-        dead   = self.head_dead(x_pool)    # (B, 1)
-        clover = self.head_clover(x_pool)  # (B, 1)
-
-        # Derived targets
-        gdm = green + clover               # (B, 1)
-        total = gdm + dead                 # (B, 1)
-
-        # Final output
-        return torch.cat([green, dead, clover, gdm, total], dim=1)  # (B, 5)
+        gdm = green + clover
+        total = gdm + dead
+        return torch.cat([green, dead, clover, gdm, total], dim=1)  # (B,5)

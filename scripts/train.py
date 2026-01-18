@@ -48,6 +48,7 @@ from models.dinov3_multi_reg import Dinov3MultiReg, Dinov3Config
 
 # IMPORTANT: you said you added make_folds() to data_split.py
 from data_split import make_folds
+import torch.nn.functional as F
 
 filterwarnings("ignore")
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -153,22 +154,38 @@ class CSIRODataset(Dataset):
         total = gdm + dead
         return torch.tensor([green, dead, clover, gdm, total], dtype=torch.float32)
 
+    def _ensure_square(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (3, H, W) -> resize to (3, S, S)
+        if t.shape[1] == self.img_size and t.shape[2] == self.img_size:
+            return t
+        t = t.unsqueeze(0)  # (1,3,H,W)
+        t = F.interpolate(t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+        return t.squeeze(0)
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-
-        targets_5 = self._read_targets_5(row)  # (5,)
+        targets_5 = self._read_targets_5(row)
 
         rel_path = str(row["image_path"])
         img_path = rel_path if os.path.isabs(rel_path) else os.path.join(self.img_dir, rel_path)
 
         with open(img_path, "rb") as f:
             image = Image.open(f).convert("RGB")
-        img = np.array(image)  # RGB uint8 HWC
+        img = np.array(image)
 
         out = self.aug(image=img)
-        img_t = out["image"]  # (3, S, 2S)
+        img_t = out["image"]  # supposed to be (3, S, 2S) but let's not trust it blindly
 
-        left_t, right_t = self._split_left_right_tensor(img_t)  # each (3, S, S)
+        left_t, right_t = self._split_left_right_tensor(img_t)
+
+        # HARD FIX: enforce exact shapes
+        left_t = self._ensure_square(left_t)
+        right_t = self._ensure_square(right_t)
+
+        # Optional assert (remove later)
+        # assert left_t.shape == (3, self.img_size, self.img_size)
+        # assert right_t.shape == (3, self.img_size, self.img_size)
+
         return left_t, right_t, targets_5
 
 
@@ -411,6 +428,9 @@ def main():
     for fold in folds_to_run:
         train_df, val_df = load_fold(splits_dir, fold)
 
+        print(f"\n========== FOLD {fold}/{len(folds_to_run)-1} ==========")
+        print(f"Train size: {len(train_df)} | Val size: {len(val_df)}")
+
         train_ds = CSIRODataset(
             train_df,
             img_dir=str(img_dir),
@@ -535,6 +555,14 @@ def main():
                     },
                     step=epoch,
                 )
+                print(
+                    f"[Fold {fold:02d}] "
+                    f"Epoch {epoch:03d}/{args.epochs:03d} | "
+                    f"lr={lr_now:.2e} | "
+                    f"train_loss={train_loss:.4f}, train_score={train_score:.4f} | "
+                    f"val_loss={val_loss:.4f}, val_score={val_score:.4f} | "
+                    f"best_val_score={best_score:.4f}"
+                )
 
                 history.append(
                     {
@@ -555,11 +583,12 @@ def main():
                         {"model_state": model.state_dict(), "epoch": epoch, "best_val_score": best_score},
                         best_ckpt_path,
                     )
+                    print(f"[Fold {fold:02d}] 🎉 New best val_score={val_score:.4f} at epoch {epoch}. Saving checkpoint.")
                     mlflow.log_artifact(str(best_ckpt_path), artifact_path=f"fold_{fold}_best")
                 else:
                     epochs_since_best += 1
                     if args.early_stopping_patience > 0 and epochs_since_best >= args.early_stopping_patience:
-                        print(f"[Fold {fold}] Early stopping: no improvement for {epochs_since_best} epochs.")
+                        print(f"[Fold {fold:02d}] 🛑 Early stopping at epoch {epoch}. Best val_score={best_score:.4f}")
                         break
 
             mlflow.log_metric("best_val_score", float(best_score))
