@@ -3,5 +3,6 @@ exps
 mlruns
 train
 test
+outputs
 
 *__pycache__*

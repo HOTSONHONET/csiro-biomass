@@ -1,446 +1,575 @@
-import os
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import pandas as pd
-from sklearn.model_selection import StratifiedKFold
-from PIL import Image
-from tqdm import tqdm
+# scripts/train.py
+# ---------------
+# CSIRO Biomass Regression Training (Albumentations + tqdm + MLflow)
+#
+# NEW: Auto-create folds if --splits-dir does not exist (or missing fold CSVs)
+#      using make_folds() from data_split.py.
+#
+# Repo layout (yours):
+# .
+# ├── scripts/
+# │   └── train.py   (this file)
+# ├── train.csv      (competition file, long format)
+# └── ... (dataset/, outputs/, mlruns/, etc.)
+#
+# Split outputs created under --splits-dir:
+#   train_fold0.csv, val_fold0.csv, ..., train_fold{k}.csv, val_fold{k}.csv
+#
+# Each fold CSV is WIDE format (one row per image) and must contain:
+#   - image_path
+#   - targets: Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g
+#   - (optional) metadata cols (State, Sampling_Date, etc.)
+
+import argparse
 import json
-import inspect
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Tuple
+
+import albumentations as A
 import mlflow
 import mlflow.pytorch
-from metrics import competition_metric, competition_metric_for_pred3
-from data_split import make_multitarget_strata, make_state_date_stratified_group_folds
-from warnings import filterwarnings 
-import random
 import numpy as np
-from datetime import datetime
-from loss_functions import WeightedRMSELoss, CSIROMultiTaskLoss
-from utils import log_model_results
-from mlflow.models import infer_signature
-from models.timm_model.model import TimmModel
-from models.vit_0.model import VitTransformer
-from pathlib import Path
-from sklearn.model_selection import StratifiedGroupKFold
+import pandas as pd
+import torch
+import torch.nn as nn
+from albumentations.pytorch import ToTensorV2
+from PIL import Image, ImageFile
+from torch.amp import GradScaler, autocast
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from warnings import filterwarnings
+
+# Your project imports
+from utils import Config, set_seed
+from models.dinov3_multi_reg import Dinov3MultiReg, Dinov3Config
+
+# IMPORTANT: you said you added make_folds() to data_split.py
+from data_split import make_folds
 
 filterwarnings("ignore")
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-class Config:
-    IMG_SIZE = 1000
-    PATCH = 16
-    EMBED_DIM = 256
-    HEADS = 4
-    DEPTH = 1 # num of transformer blocks
-
-    N_SPLITS = 5
-    EPOCHS = 20
-    BATCH = 4
-    LR = 1e-4
-
-    NUM_WORKERS = 16
-    VAL_WORKERS = 16
-
-    TRAIN_CSV = "dataset/train_df.csv"
-    IMG_DIR = "."
-    SEED = 42
-
-    IN_CHANNELS = 3
-    GRID = (2, 2)
-    DROPOUT = 0.2
-
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    MODEL_MAP = dict(
-        vit_scratch = VitTransformer,
-        timm_model = TimmModel,
-    )
-    MODEL = "timm_model"
-    TIMM_BASE_MODEL = 'vit_base_patch16_dinov3.lvd1689m'
-    TARGET_COLS = [
-        "Dry_Green_g",
-        "Dry_Dead_g",
-        "Dry_Clover_g",
-        "GDM_g",
-        "Dry_Total_g",
-        "Pre_GSHH_NDVI",
-        "Height_Ave_cm",
-    ]
-    NUM_CLASSES = len(TARGET_COLS)
-
-    @classmethod
-    def to_dict(cls):
-        cfg = {
-            name: value 
-            for name, value in cls.__dict__.items() 
-            if not name.startswith('__') 
-            and not callable(value) 
-            and name.upper() == name
-        }
-
-        # storing class names in MODEL_MAP
-        model_map_classnames = {}
-        for model_name, model_class in cfg['MODEL_MAP'].items():
-            model_map_classnames[model_name] = model_class.__name__
-
-        cfg['MODEL_MAP'] = model_map_classnames
-        return cfg
-
-
-def set_seed(seed):
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
+# -----------------------------
+# Dataset (Albumentations end-to-end)
+# -----------------------------
 class CSIRODataset(Dataset):
     """
     Returns:
-        image: Tensor (C, H, W)
-        targets: Tensor (3,) -> Config.TARGET_COLS
+        left_t:   torch.FloatTensor (3, S, S)
+        right_t:  torch.FloatTensor (3, S, S)
+        targets5: torch.FloatTensor (5,) -> [green, dead, clover, gdm, total]
+    Notes:
+      - We resize FULL image to (S, 2S) so halves are square (S, S).
+      - Apply RandomShadow on FULL image (recommended), then split.
+      - Fold CSVs are expected to be WIDE format.
     """
-    def __init__(self, df, img_dir=".", is_train: bool = True):
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        img_dir: str,
+        img_size: int,
+        is_train: bool = True,
+        shadow_p: float = 0.5,
+    ):
         self.df = df.reset_index(drop=True)
         self.img_dir = img_dir
+        self.img_size = int(img_size)
         self.is_train = is_train
 
-        # order must match model outputs
-        self.base_cols = Config.TARGET_COLS # Ordering is important
+        # For wide fold CSVs we will read these 5 targets directly if present.
+        # If your fold CSV contains only 3 base cols, we can derive 5.
+        self.base3_cols = getattr(Config, "TARGET_COLS", ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g"])
+        self.target5_cols = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
 
+        # Resize full image to (S, 2S) so left/right are (S, S)
         if self.is_train:
-            self.transform = transforms.Compose([
-                transforms.Resize(
-                    (Config.IMG_SIZE, Config.IMG_SIZE),
-                    antialias=True
-                ),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-                transforms.RandomRotation(degrees=90),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225),
-                ),
-            ])
+            self.aug = A.Compose(
+                [
+                    A.Resize(self.img_size, self.img_size * 2),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.RandomRotate90(p=0.5),
+
+                    A.RandomShadow(
+                        shadow_roi=(0, 0, 1, 1),
+                        num_shadows_lower=1,
+                        num_shadows_upper=2,
+                        shadow_dimension=5,
+                        p=shadow_p,
+                    ),
+
+                    A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 2.0), p=0.2),
+
+                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                    ToTensorV2(),
+                ]
+            )
         else:
-            self.transform = transforms.Compose([
-                transforms.Resize(
-                    (Config.IMG_SIZE, Config.IMG_SIZE),
-                    antialias=True
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225),
-                ),
-            ])
+            self.aug = A.Compose(
+                [
+                    A.Resize(self.img_size, self.img_size * 2),
+                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                    ToTensorV2(),
+                ]
+            )
 
     def __len__(self):
         return len(self.df)
 
-    def get_n_patches(self, image, rows, cols):
-        width, height = image.size
+    @staticmethod
+    def _split_left_right_tensor(img_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        img_t: (3, H, W) where H = S and W = 2S
+        returns:
+          left:  (3, S, S)
+          right: (3, S, S)
+        """
+        _, _, w = img_t.shape
+        mid = w // 2
+        left = img_t[:, :, :mid]
+        right = img_t[:, :, mid:]
+        return left, right
 
-        tile_width = width // cols
-        tile_height = height // rows
+    def _read_targets_5(self, row: pd.Series) -> torch.Tensor:
+        """
+        Prefer reading 5 targets directly from wide fold CSV.
+        Fallback: read base3 and derive gdm/total.
+        """
+        # If fold CSV already has 5 targets, use them directly
+        has_5 = all(c in row.index for c in self.target5_cols)
+        if has_5:
+            vals = row[self.target5_cols].to_numpy(dtype="float32", na_value=0.0)
+            return torch.from_numpy(vals)  # (5,)
 
-        patches = []
-        for r in range(rows):
-            for c in range(cols):
-                x1 = c * tile_width
-                y1 = r * tile_height
-
-                x2 = x1 + tile_width
-                y2 = y1 + tile_height
-
-                patch = image.crop(tuple(map(int, (x1, y1, x2, y2))))
-                patches.append(patch)
-        return patches
+        # Otherwise, use base3 and derive
+        vals3 = row[self.base3_cols].to_numpy(dtype="float32", na_value=0.0)
+        green, dead, clover = vals3.tolist()
+        gdm = green + clover
+        total = gdm + dead
+        return torch.tensor([green, dead, clover, gdm, total], dtype=torch.float32)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        # Force numeric conversion here
-        vals = row[self.base_cols].to_numpy(dtype="float32", na_value=0.0)
-        targets = torch.from_numpy(vals)  # (3,)
+        targets_5 = self._read_targets_5(row)  # (5,)
 
-        img_path = os.path.join(self.img_dir, row["image_path"])
+        rel_path = str(row["image_path"])
+        img_path = rel_path if os.path.isabs(rel_path) else os.path.join(self.img_dir, rel_path)
 
-        image = Image.open(img_path).convert("RGB")
+        with open(img_path, "rb") as f:
+            image = Image.open(f).convert("RGB")
+        img = np.array(image)  # RGB uint8 HWC
 
-        # converting the image into patches
-        # left, right = self.get_n_patches(image, rows=1, cols = 2)
-        w, h = image.size
-        mid_w = w // 2
-        left = image.crop((0, 0, mid_w, h))
-        right = image.crop((mid_w, 0, w, h))
+        out = self.aug(image=img)
+        img_t = out["image"]  # (3, S, 2S)
 
-        left_t = self.transform(left)
-        right_t = self.transform(right)
+        left_t, right_t = self._split_left_right_tensor(img_t)  # each (3, S, S)
+        return left_t, right_t, targets_5
 
-        return left_t, right_t, targets
 
-class Runner:
-    def __init__(self):
-        # Setting seed for the run
-        set_seed(seed = Config.SEED)
+# -----------------------------
+# Loss + Metric
+# -----------------------------
+def weighted_rmse_loss(preds_5: torch.Tensor, targets_5: torch.Tensor) -> torch.Tensor:
+    """
+    preds_5, targets_5: (B,5) in order
+      [Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g]
+    """
+    weights = torch.tensor([0.1, 0.1, 0.1, 0.2, 0.5], device=preds_5.device, dtype=torch.float32)
+    se = (preds_5 - targets_5) ** 2
+    return (weights * se).sum(dim=1).mean()
 
-        # Setting up experiment directory
-        parent_dir = "exps"
-        ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        self.run_name = f"CSIRO-Biomass-ViT-{ts}"
-        self.exp_dir = os.path.join(parent_dir, self.run_name)
-        os.makedirs(self.exp_dir, exist_ok=True)
 
-        # Initiailizing configs
-        self.df = pd.read_csv(Config.TRAIN_CSV)
-        self.target_cols = Config.TARGET_COLS
-        for c in self.target_cols:
-            self.df[c] = pd.to_numeric(self.df[c], errors="coerce")
+def competition_metric(preds_5: torch.Tensor, targets_5: torch.Tensor) -> float:
+    """Weighted R^2 over 5 targets."""
+    w = torch.tensor([0.1, 0.1, 0.1, 0.2, 0.5], device=preds_5.device, dtype=torch.float32).view(1, 5)
+    w_sum = w.sum()
+    N = targets_5.shape[0]
 
-        self.df = make_state_date_stratified_group_folds(
-            self.df,
-            seed = Config.SEED,
-            n_splits=Config.N_SPLITS,
-            state_col="State",
-            date_col="Sampling_Date",
+    y_true = targets_5
+    y_pred = preds_5
+
+    y_mean = (w * y_true).sum() / (w_sum * N)
+    ss_res = (w * (y_true - y_pred) ** 2).sum()
+    ss_tot = (w * (y_true - y_mean) ** 2).sum() + 1e-9
+
+    return float((1.0 - ss_res / ss_tot).item())
+
+
+# -----------------------------
+# Train / Val loops (tqdm)
+# -----------------------------
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: Optional[GradScaler],
+    device: torch.device,
+) -> Tuple[float, float]:
+    model.train()
+    total_loss = 0.0
+    total_score = 0.0
+    count = 0
+
+    use_amp = scaler is not None and scaler.is_enabled()
+    pbar = tqdm(loader, desc="Train", leave=False, dynamic_ncols=True)
+
+    for left_t, right_t, y in pbar:
+        left_t = left_t.to(device, non_blocking=True)
+        right_t = right_t.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast(device_type=device.type, enabled=use_amp):
+            preds = model((left_t, right_t))
+            loss = weighted_rmse_loss(preds, y)
+
+        score = competition_metric(preds.detach(), y)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        bs = y.size(0)
+        total_loss += loss.item() * bs
+        total_score += score * bs
+        count += bs
+
+        pbar.set_postfix(loss=f"{loss.item():.4f}", score=f"{score:.4f}")
+
+    return total_loss / max(1, count), total_score / max(1, count)
+
+
+@torch.no_grad()
+def val_one_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_score = 0.0
+    count = 0
+
+    pbar = tqdm(loader, desc="Val", leave=False, dynamic_ncols=True)
+    for left_t, right_t, y in pbar:
+        left_t = left_t.to(device, non_blocking=True)
+        right_t = right_t.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        preds = model((left_t, right_t))
+        loss = weighted_rmse_loss(preds, y)
+        score = competition_metric(preds, y)
+
+        bs = y.size(0)
+        total_loss += loss.item() * bs
+        total_score += score * bs
+        count += bs
+
+        pbar.set_postfix(loss=f"{loss.item():.4f}", score=f"{score:.4f}")
+
+    return total_loss / max(1, count), total_score / max(1, count)
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+# -----------------------------
+# Splits utilities
+# -----------------------------
+def fold_files_exist(splits_dir: Path, n_splits: int) -> bool:
+    """Return True if all train_fold{i}.csv and val_fold{i}.csv exist."""
+    for f in range(n_splits):
+        if not (splits_dir / f"train_fold{f}.csv").exists():
+            return False
+        if not (splits_dir / f"val_fold{f}.csv").exists():
+            return False
+    return True
+
+
+def ensure_splits_exist(
+    repo_root: Path,
+    splits_dir: Path,
+    train_csv_path: Path,
+    n_splits: int,
+    seed: int,
+):
+    """
+    If splits_dir doesn't exist OR fold files are missing, call make_folds(...)
+    to generate them.
+    """
+    splits_dir.mkdir(parents=True, exist_ok=True)
+
+    if fold_files_exist(splits_dir, n_splits):
+        print(f"[Splits] Found existing fold CSVs in: {splits_dir}")
+        return
+
+    print(f"[Splits] Fold CSVs not found in: {splits_dir}")
+    print(f"[Splits] Creating folds from: {train_csv_path}")
+    make_folds(
+        train_csv=str(train_csv_path),
+        out_dir=str(splits_dir),
+        n_splits=n_splits,
+        seed=seed,
+    )
+    print(f"[Splits] Done. Wrote folds to: {splits_dir}")
+
+
+def load_fold(splits_dir: Path, fold: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_path = splits_dir / f"train_fold{fold}.csv"
+    val_path = splits_dir / f"val_fold{fold}.csv"
+    if not train_path.exists() or not val_path.exists():
+        raise FileNotFoundError(f"Missing split CSVs for fold {fold} in {splits_dir}")
+    return pd.read_csv(train_path), pd.read_csv(val_path)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(description="CSIRO Biomass Regression Training (auto folds)")
+    parser.add_argument("--repo-root", default=".", help="Repository root.")
+    parser.add_argument("--img-dir", default=".", help="Base directory for image_path (relative paths).")
+
+    # If splits-dir does not exist OR fold CSVs missing, script will create it.
+    parser.add_argument("--splits-dir", default="exps/splits", help="Directory to read/write fold CSVs.")
+
+    # train.csv (competition long-format) used ONLY when creating folds
+    parser.add_argument("--train-csv", default="train.csv", help="Competition train.csv (long format).")
+
+    parser.add_argument("--n-splits", type=int, default=5, help="Number of folds to create/use.")
+    parser.add_argument("--no-folds", action="store_true", help="Run only fold 0.")
+
+    parser.add_argument("--epochs", type=int, default=getattr(Config, "EPOCHS", 30))
+    parser.add_argument("--early-stopping-patience", type=int, default=0)
+
+    parser.add_argument("--batch-size", type=int, default=getattr(Config, "BATCH", 8))
+    parser.add_argument("--lr", type=float, default=getattr(Config, "LR", 3e-4))
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--lr-scheduler", choices=["none", "cosine", "onecycle"], default="none")
+    parser.add_argument("--warmup-epochs", type=int, default=0)
+
+    parser.add_argument("--img-size", type=int, default=getattr(Config, "IMG_SIZE", 512))
+    parser.add_argument("--num-workers", type=int, default=getattr(Config, "NUM_WORKERS", 4))
+    parser.add_argument("--pin-memory", action="store_true")
+
+    parser.add_argument("--shadow-p", type=float, default=0.5, help="RandomShadow probability (train only).")
+    parser.add_argument("--model-id", default="facebook/dinov3-vith16plus-pretrain-lvd1689m")
+
+    # MLflow
+    parser.add_argument("--experiment-name", default=getattr(Config, "EXPERIMENT_NAME", "csiro_biomass"))
+    parser.add_argument("--mlflow-uri", default=None)
+
+    # Outputs
+    parser.add_argument("--output-dir", default=getattr(Config, "OUTPUT_DIR", "outputs"))
+    parser.add_argument("--seed", type=int, default=getattr(Config, "SEED", 42))
+
+    args = parser.parse_args()
+
+    repo_root = Path(args.repo_root).resolve()
+    img_dir = (repo_root / args.img_dir).resolve()
+    splits_dir = (repo_root / args.splits_dir).resolve()
+    train_csv_path = (repo_root / args.train_csv).resolve()
+
+    # Ensure splits exist (create if missing)
+    ensure_splits_exist(
+        repo_root=repo_root,
+        splits_dir=splits_dir,
+        train_csv_path=train_csv_path,
+        n_splits=args.n_splits,
+        seed=args.seed,
+    )
+
+    # Output run folder
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_out_dir = (repo_root / args.output_dir / timestamp).resolve()
+    run_out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(run_out_dir / "cli_args.json", "w", encoding="utf-8") as f:
+        json.dump({"argv": sys.argv, "parsed": vars(args)}, f, indent=2, sort_keys=True)
+
+    # Device + seed
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(args.seed)
+
+    # MLflow
+    if args.mlflow_uri:
+        mlflow.set_tracking_uri(args.mlflow_uri)
+    mlflow.set_experiment(f"{args.experiment_name}_{timestamp}")
+
+    folds_to_run = [0] if args.no_folds else list(range(args.n_splits))
+    cfg = Dinov3Config(model_id=args.model_id, patch_size=16)
+
+    for fold in folds_to_run:
+        train_df, val_df = load_fold(splits_dir, fold)
+
+        train_ds = CSIRODataset(
+            train_df,
+            img_dir=str(img_dir),
+            img_size=args.img_size,
+            is_train=True,
+            shadow_p=args.shadow_p,
+        )
+        val_ds = CSIRODataset(
+            val_df,
+            img_dir=str(img_dir),
+            img_size=args.img_size,
+            is_train=False,
+            shadow_p=0.0,
         )
 
-    def run(self):
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            drop_last=False,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size * 2,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            drop_last=False,
+        )
 
-        mlflow.set_experiment(f"CSIRO-Biomass-ViT")
+        model = Dinov3MultiReg(cfg).to(device)
 
-        with mlflow.start_run(run_name=self.run_name) as parent_run:
-            parent_run_id = parent_run.info.run_id
+        # optimizer only trainable params (encoder is frozen inside model)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
-            mlflow.log_params(Config.to_dict())
-            
-            config_path = os.path.join(self.exp_dir, "config_dump.json")
-            with open(config_path, "w") as f: json.dump(Config.to_dict(), f, indent=4)
-            mlflow.log_artifact(config_path)
+        use_amp = device.type == "cuda"
+        scaler = GradScaler(enabled=use_amp) if use_amp else None
 
-            script_path = inspect.getfile(Runner)
-            mlflow.log_artifact(script_path)
+        scheduler = None
+        warmup_epochs = max(0, int(args.warmup_epochs))
 
-            for fold in range(Config.N_SPLITS):
-                train_df = self.df[self.df["fold"] != fold].reset_index(drop = True)
-                val_df = self.df[self.df["fold"] == fold].reset_index(drop = True)
+        if args.lr_scheduler == "cosine":
+            if warmup_epochs >= args.epochs:
+                raise ValueError("--warmup-epochs must be < total epochs for cosine schedule.")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, args.epochs - warmup_epochs)
+            )
+        elif args.lr_scheduler == "onecycle":
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=args.lr,
+                epochs=args.epochs,
+                steps_per_epoch=len(train_loader),
+                pct_start=0.1,
+            )
 
-                print(f"\n========== Fold {fold+1}/{Config.N_SPLITS} ==========")
+        best_score = -1e18
+        epochs_since_best = 0
+        best_ckpt_path = run_out_dir / f"dinov3_reg_fold{fold}.pt"
+        history = []
 
-                with mlflow.start_run(
-                    run_name = f"{self.run_name}_fold{fold + 1}",
-                    nested = True,
-                ) as fold_run:
-                    
-                    fold_run_id = fold_run.info.run_id
-                    print(f"    Fold run_id: {fold_run_id}")
-                    mlflow.log_param("fold", fold + 1)
+        with mlflow.start_run(run_name=f"fold_{fold}"):
+            mlflow.log_artifact(str(run_out_dir / "cli_args.json"))
+            mlflow.log_params(
+                {
+                    "fold": fold,
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "lr_scheduler": args.lr_scheduler,
+                    "warmup_epochs": args.warmup_epochs,
+                    "early_stopping_patience": args.early_stopping_patience,
+                    "img_size_half": args.img_size,
+                    "full_resize": f"{args.img_size}x{args.img_size*2}",
+                    "shadow_p": args.shadow_p,
+                    "model_id": args.model_id,
+                    "seed": args.seed,
+                    "device": device.type,
+                    "frozen_backbone": True,
+                    "splits_dir": str(splits_dir),
+                    "train_csv_for_splits": str(train_csv_path),
+                }
+            )
 
-                    train_ds = CSIRODataset(train_df, Config.IMG_DIR, True)
-                    val_ds   = CSIRODataset(val_df, Config.IMG_DIR, False)
+            epoch_bar = tqdm(range(1, args.epochs + 1), desc=f"Fold {fold}", dynamic_ncols=True)
 
-                    train_loader = DataLoader(
-                        train_ds,
-                        batch_size=Config.BATCH,
-                        shuffle=True,
-                        num_workers=Config.NUM_WORKERS,
-                        pin_memory=True,
-                        prefetch_factor=2,
-                        persistent_workers=True,
-                    )
+            for epoch in epoch_bar:
+                # cosine warmup
+                if args.lr_scheduler == "cosine" and warmup_epochs > 0 and epoch <= warmup_epochs:
+                    warmup_lr = args.lr * (epoch / warmup_epochs)
+                    set_optimizer_lr(optimizer, warmup_lr)
 
-                    val_loader = DataLoader(
-                        val_ds,
-                        batch_size=Config.BATCH,
-                        shuffle=False,
-                        num_workers=Config.VAL_WORKERS,
-                        pin_memory=True,
-                    )
+                train_loss, train_score = train_one_epoch(model, train_loader, optimizer, scaler, device)
+                val_loss, val_score = val_one_epoch(model, val_loader, device)
 
-                    model = Config.MODEL_MAP[Config.MODEL](Config).to(Config.DEVICE, )
-                    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR)
+                # scheduler steps
+                if args.lr_scheduler == "onecycle" and scheduler is not None:
+                    scheduler.step()
+                elif args.lr_scheduler == "cosine" and scheduler is not None and epoch > warmup_epochs:
+                    scheduler.step()
 
-                    # loss_weights = [0.5, 0.2, 0.1]
-                    # loss_fn = WeightedRMSELoss(weights=loss_weights).to(Config.DEVICE)
+                lr_now = optimizer.param_groups[0]["lr"]
+                epoch_bar.set_postfix(
+                    tr_loss=f"{train_loss:.4f}",
+                    tr_score=f"{train_score:.4f}",
+                    va_loss=f"{val_loss:.4f}",
+                    va_score=f"{val_score:.4f}",
+                    lr=f"{lr_now:.2e}",
+                )
 
+                mlflow.log_metrics(
+                    {
+                        "train_loss": train_loss,
+                        "train_score": train_score,
+                        "val_loss": val_loss,
+                        "val_score": val_score,
+                        "lr": lr_now,
+                    },
+                    step=epoch,
+                )
 
-                    loss_fn = CSIROMultiTaskLoss(
-                        biomass_weights=[0.1, 0.1, 0.1, 0.2, 0.5],
-                        aux_ndvi_weight=0.1,
-                        aux_height_weight=0.1,
-                    ).to(Config.DEVICE)
-                    scaler = torch.amp.GradScaler(device = Config.DEVICE)
-
-                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer, mode='min', factor=0.5, patience=5
-                    )
-                    best_comp_score = float('-inf')
-                    best_ckpt_path = os.path.join(self.exp_dir, f"best_model_fold{fold+1}.pth")
-
-                    # ================= TRAINING ==================
-                    for epoch in range(Config.EPOCHS):
-                        model.train()
-                        total_loss = 0.0
-
-                        for (left, right, targets) in tqdm(
-                            train_loader, desc=f"Epoch {epoch+1}/{Config.EPOCHS}", ncols=100
-                        ):
-                            left = left.to(Config.DEVICE, non_blocking=True)
-                            right = right.to(Config.DEVICE, non_blocking=True)
-                            targets = targets.to(Config.DEVICE, non_blocking=True)
-
-                            optimizer.zero_grad()
-
-                            with torch.amp.autocast(device_type = Config.DEVICE):
-                                preds = model(left, right)  # (B, 3)
-                                # loss = loss_fn(preds, targets)
-                                loss, loss_dict = loss_fn(preds, targets)
-
-                            scaler.scale(loss).backward()
-                            scaler.step(optimizer)
-                            scaler.update()
-
-                            total_loss += loss.item()
-
-                        train_loss_mean = total_loss / len(train_loader)
-                        mlflow.log_metric("train_loss_mean", train_loss_mean, step=epoch)
-                        print(f"train_loss_mean ({Config.NUM_CLASSES} targets): {train_loss_mean:.4f}")
-
-                        # ================= VALIDATION ==================
-                        model.eval()
-                        vloss = 0.0
-                        all_val_preds = []
-                        with torch.no_grad():
-                            for (left, right, targets) in tqdm(val_loader, desc=f"eval {epoch+1}", ncols=100):
-                                left = left.to(Config.DEVICE, non_blocking=True)
-                                right = right.to(Config.DEVICE, non_blocking=True)
-                                targets = targets.to(Config.DEVICE, non_blocking=True)
-
-                                preds = model(left, right)  # (B, 3)
-
-                                all_val_preds.append(preds.detach().cpu())
-                                loss, loss_dict = loss_fn(preds, targets)
-                                vloss += loss.item()
-
-                        val_loss_mean = vloss / len(val_loader)
-                        mlflow.log_metric("val_loss_mean", val_loss_mean, step=epoch)
-                        print(f"val_loss_mean ({Config.NUM_CLASSES} targets): {val_loss_mean:.4f}")
-
-                        # ===== COMPETITION METRIC =====
-                        preds_all = torch.cat(all_val_preds, dim=0)
-
-                        # GT for all 5 targets in this fold, same row order as val_df
-                        all_targets = torch.tensor(
-                            val_df[self.target_cols].values, dtype=torch.float32
-                        )
-
-                        preds_5   = preds_all[:, :5]
-                        targets_5 = all_targets[:, :5]
-                        val_comp_score = competition_metric(preds_5, targets_5)
-                        mlflow.log_metric("val_competition_metric", val_comp_score, step=epoch)
-                        print(f"Val competition metric: {val_comp_score:.4f}")
-
-                        # ===== LR Decay + ModelCheckpointing =====
-                        current_lr = optimizer.param_groups[0]['lr']
-                        mlflow.log_metric("lr", current_lr, step=epoch)
-                        scheduler.step(val_loss_mean)
-
-                        # Checkpointing: if best comp score so far, save
-                        if val_comp_score > best_comp_score:
-                            best_comp_score = val_comp_score
-                            print(f" >> New best comp metric {best_comp_score:.4f}, saving checkpoint to {best_ckpt_path}")
-                            torch.save({
-                                'epoch': epoch,
-                                'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'scheduler_state_dict': scheduler.state_dict(),
-                                'val_competition_metric': best_comp_score,
-                            }, best_ckpt_path)
-
-                            mlflow.log_artifact(best_ckpt_path, artifact_path=f"best_checkpoints_fold{fold+1}")
-
-                    # ===== Training + Validation results =====
-                    model.eval()
-                    vloss = 0.0
-                    all_val_preds = []
-                    all_train_preds = []
-                    with torch.no_grad():
-                    
-                        for (left, right, _) in train_loader:
-                            left = left.to(Config.DEVICE, non_blocking=True)
-                            right = right.to(Config.DEVICE, non_blocking=True)
-                            preds = model(left, right)
-                            all_train_preds.append(preds.detach().cpu())
-
-                        for (left, right, _) in val_loader:
-                            left = left.to(Config.DEVICE, non_blocking=True)
-                            right = right.to(Config.DEVICE, non_blocking=True)
-                            preds = model(left, right) 
-                            all_val_preds.append(preds.detach().cpu())
-
-                    train_preds = torch.cat(all_train_preds, dim = 0).numpy()
-                    val_preds = torch.cat(all_val_preds, dim = 0).numpy()
-
-                    log_model_results(
-                        mlflow_instance=mlflow,
-                        train_preds = train_preds,
-                        val_preds = val_preds,
-                        target_cols = Config.TARGET_COLS,
-                        train_df = train_df,
-                        val_df = val_df,
-                        exp_dir = self.exp_dir,
-                        fold = fold,
-                    )
-
-                    # Save model weights as artifact
-                    save_path = os.path.join(self.exp_dir, f"fold_{fold+1}.pth")
-                    torch.save(model.state_dict(), save_path)
-
-                    # Save as MLflow PyTorch model
-
-                    model.eval()
-
-                    left_batch, right_batch, _ = next(iter(val_loader))
-                    left_batch = left_batch.to(Config.DEVICE)
-                    right_batch = right_batch.to(Config.DEVICE)
-
-                    with torch.no_grad():
-                        example_output = model(left_batch, right_batch)
-
-                    example_input = {
-                        "left": left_batch[:1].detach().cpu().numpy(),
-                        "right": right_batch[:1].detach().cpu().numpy()
+                history.append(
+                    {
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "train_score": train_score,
+                        "val_loss": val_loss,
+                        "val_score": val_score,
+                        "lr": lr_now,
                     }
-                    example_output_np = example_output[:1].detach().cpu().numpy()
+                )
 
-                    signature = infer_signature(
-                        model_input=example_input, 
-                        model_output=example_output_np
+                # best checkpoint on val_score (higher is better)
+                if val_score > best_score:
+                    best_score = val_score
+                    epochs_since_best = 0
+                    torch.save(
+                        {"model_state": model.state_dict(), "epoch": epoch, "best_val_score": best_score},
+                        best_ckpt_path,
                     )
-                    mlflow.pytorch.log_model(
-                        pytorch_model= model, 
-                        artifact_path = f"fold_{fold+1}",
-                        input_example = example_input,
-                        signature = signature
-                    )
+                    mlflow.log_artifact(str(best_ckpt_path), artifact_path=f"fold_{fold}_best")
+                else:
+                    epochs_since_best += 1
+                    if args.early_stopping_patience > 0 and epochs_since_best >= args.early_stopping_patience:
+                        print(f"[Fold {fold}] Early stopping: no improvement for {epochs_since_best} epochs.")
+                        break
 
+            mlflow.log_metric("best_val_score", float(best_score))
 
-            for py_file in SCRIPT_DIR.rglob("*.py"):
-                rel = py_file.relative_to(SCRIPT_DIR).parent
-                artifact_subdir = str(Path("scripts") / rel)
-                mlflow.log_artifact(str(py_file), artifact_path=artifact_subdir)
+            hist_path = run_out_dir / f"history_fold{fold}.csv"
+            pd.DataFrame(history).to_csv(hist_path, index=False)
+            mlflow.log_artifact(str(hist_path), artifact_path=f"fold_{fold}_history")
+
+    print(f"Done ✅ Saved outputs to: {run_out_dir}")
+
 
 if __name__ == "__main__":
-    Runner().run()
+    main()
