@@ -73,7 +73,6 @@ class CSIRODataset(Dataset):
             self.aug = A.Compose([
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
-                A.RandomRotate90(p=0.5),
                 A.RandomShadow(
                     shadow_roi=(0, 0, 1, 1),
                     num_shadows_lower=1,
