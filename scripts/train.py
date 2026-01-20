@@ -58,135 +58,61 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # Dataset (Albumentations end-to-end)
 # -----------------------------
 class CSIRODataset(Dataset):
-    """
-    Returns:
-        left_t:   torch.FloatTensor (3, S, S)
-        right_t:  torch.FloatTensor (3, S, S)
-        targets5: torch.FloatTensor (5,) -> [green, dead, clover, gdm, total]
-    Notes:
-      - We resize FULL image to (S, 2S) so halves are square (S, S).
-      - Apply RandomShadow on FULL image (recommended), then split.
-      - Fold CSVs are expected to be WIDE format.
-    """
-
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        img_dir: str,
-        img_size: int,
-        is_train: bool = True,
-        shadow_p: float = 0.5,
-    ):
+    def __init__(self, df, img_dir, img_size, is_train=True, shadow_p=0.5):
         self.df = df.reset_index(drop=True)
         self.img_dir = img_dir
-        self.img_size = int(img_size)
+        self.S = int(img_size)
         self.is_train = is_train
 
-        # For wide fold CSVs we will read these 5 targets directly if present.
-        # If your fold CSV contains only 3 base cols, we can derive 5.
-        self.base3_cols = getattr(Config, "TARGET_COLS", ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g"])
         self.target5_cols = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
 
-        # Resize full image to (S, 2S) so left/right are (S, S)
-        if self.is_train:
-            self.aug = A.Compose(
-                [
-                    A.Resize(self.img_size, self.img_size * 2),
-                    A.HorizontalFlip(p=0.5),
-                    A.VerticalFlip(p=0.5),
-                    A.RandomRotate90(p=0.5),
+        self.H = self.S * 2
+        self.W = self.S * 4
 
-                    A.RandomShadow(
-                        shadow_roi=(0, 0, 1, 1),
-                        num_shadows_lower=1,
-                        num_shadows_upper=2,
-                        shadow_dimension=5,
-                        p=shadow_p,
-                    ),
-
-                    A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 2.0), p=0.2),
-
-                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                    ToTensorV2(),
-                ]
-            )
+        if is_train:
+            self.aug = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.RandomShadow(
+                    shadow_roi=(0, 0, 1, 1),
+                    num_shadows_lower=1,
+                    num_shadows_upper=2,
+                    shadow_dimension=5,
+                    p=shadow_p,
+                ),
+                A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 2.0), p=0.2),
+                A.Resize(self.H, self.W),
+                A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+                ToTensorV2(),
+            ])
         else:
-            self.aug = A.Compose(
-                [
-                    A.Resize(self.img_size, self.img_size * 2),
-                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                    ToTensorV2(),
-                ]
-            )
+            self.aug = A.Compose([
+                A.Resize(self.H, self.W),
+                A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+                ToTensorV2(),
+            ])
 
     def __len__(self):
         return len(self.df)
 
-    @staticmethod
-    def _split_left_right_tensor(img_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        img_t: (3, H, W) where H = S and W = 2S
-        returns:
-          left:  (3, S, S)
-          right: (3, S, S)
-        """
-        _, _, w = img_t.shape
-        mid = w // 2
-        left = img_t[:, :, :mid]
-        right = img_t[:, :, mid:]
-        return left, right
-
-    def _read_targets_5(self, row: pd.Series) -> torch.Tensor:
-        """
-        Prefer reading 5 targets directly from wide fold CSV.
-        Fallback: read base3 and derive gdm/total.
-        """
-        # If fold CSV already has 5 targets, use them directly
-        has_5 = all(c in row.index for c in self.target5_cols)
-        if has_5:
-            vals = row[self.target5_cols].to_numpy(dtype="float32", na_value=0.0)
-            return torch.from_numpy(vals)  # (5,)
-
-        # Otherwise, use base3 and derive
-        vals3 = row[self.base3_cols].to_numpy(dtype="float32", na_value=0.0)
-        green, dead, clover = vals3.tolist()
-        gdm = green + clover
-        total = gdm + dead
-        return torch.tensor([green, dead, clover, gdm, total], dtype=torch.float32)
-
-    def _ensure_square(self, t: torch.Tensor) -> torch.Tensor:
-        # t: (3, H, W) -> resize to (3, S, S)
-        if t.shape[1] == self.img_size and t.shape[2] == self.img_size:
-            return t
-        t = t.unsqueeze(0)  # (1,3,H,W)
-        t = F.interpolate(t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
-        return t.squeeze(0)
-
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        targets_5 = self._read_targets_5(row)
+
+        y = torch.tensor(row[self.target5_cols].to_numpy(dtype="float32", na_value=0.0), dtype=torch.float32)  # (5,)
 
         rel_path = str(row["image_path"])
         img_path = rel_path if os.path.isabs(rel_path) else os.path.join(self.img_dir, rel_path)
 
         with open(img_path, "rb") as f:
-            image = Image.open(f).convert("RGB")
-        img = np.array(image)
+            img = np.array(Image.open(f).convert("RGB"))
 
-        out = self.aug(image=img)
-        img_t = out["image"]  # supposed to be (3, S, 2S) but let's not trust it blindly
+        img_t = self.aug(image=img)["image"]   # (3,H,W)
+        if img_t.shape[-2:] != (self.H, self.W):
+            raise RuntimeError(f"Bad shape: {img_t.shape}, expected (3,{self.H},{self.W})")
 
-        left_t, right_t = self._split_left_right_tensor(img_t)
+        return img_t, y
 
-        # HARD FIX: enforce exact shapes
-        left_t = self._ensure_square(left_t)
-        right_t = self._ensure_square(right_t)
-
-        # Optional assert (remove later)
-        # assert left_t.shape == (3, self.img_size, self.img_size)
-        # assert right_t.shape == (3, self.img_size, self.img_size)
-
-        return left_t, right_t, targets_5
 
 
 # -----------------------------
@@ -236,15 +162,16 @@ def train_one_epoch(
     use_amp = scaler is not None and scaler.is_enabled()
     pbar = tqdm(loader, desc="Train", leave=False, dynamic_ncols=True)
 
-    for left_t, right_t, y in pbar:
-        left_t = left_t.to(device, non_blocking=True)
-        right_t = right_t.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+    for img_full_t, y in pbar:
+        img_full_t = img_full_t.to(device, non_blocking=True)  # (B,3,2S,4S)
+        y = y.to(device, non_blocking=True)  
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, enabled=use_amp):
-            preds = model((left_t, right_t))
+            # preds = model((left_t, right_t))
+            
+            preds = model(img_full_t)             
             loss = weighted_rmse_loss(preds, y)
 
         score = competition_metric(preds.detach(), y)
@@ -275,12 +202,14 @@ def val_one_epoch(model: nn.Module, loader: DataLoader, device: torch.device) ->
     count = 0
 
     pbar = tqdm(loader, desc="Val", leave=False, dynamic_ncols=True)
-    for left_t, right_t, y in pbar:
-        left_t = left_t.to(device, non_blocking=True)
-        right_t = right_t.to(device, non_blocking=True)
+    for img_full_t, y in pbar:
+        img_full_t = img_full_t.to(device, non_blocking=True)  # (B,3,2S,4S)
+
         y = y.to(device, non_blocking=True)
 
-        preds = model((left_t, right_t))
+        # preds = model((left_t, right_t))
+
+        preds = model(img_full_t)      
         loss = weighted_rmse_loss(preds, y)
         score = competition_metric(preds, y)
 
@@ -388,6 +317,9 @@ def main():
     # Outputs
     parser.add_argument("--output-dir", default=getattr(Config, "OUTPUT_DIR", "outputs"))
     parser.add_argument("--seed", type=int, default=getattr(Config, "SEED", 42))
+    parser.add_argument("--model-name", type=str, choices=[
+        "Dinov3MultiReg",
+    ])
 
     args = parser.parse_args()
 
@@ -423,7 +355,6 @@ def main():
     mlflow.set_experiment(f"{args.experiment_name}_{timestamp}")
 
     folds_to_run = [0] if args.no_folds else list(range(args.n_splits))
-    cfg = Dinov3Config(model_id=args.model_id, patch_size=16)
 
     for fold in folds_to_run:
         train_df, val_df = load_fold(splits_dir, fold)
@@ -463,7 +394,11 @@ def main():
             drop_last=False,
         )
 
-        model = Dinov3MultiReg(cfg).to(device)
+        if args.model_name == "Dinov3MultiReg":
+            cfg = Dinov3Config(model_id=args.model_id, patch_size=16)
+            model = Dinov3MultiReg(cfg).to(device)
+        else:
+            raise Exception("Unknown model name: ", args.model_name)
 
         # optimizer only trainable params (encoder is frozen inside model)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
