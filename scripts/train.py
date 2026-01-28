@@ -2,23 +2,21 @@
 # ---------------
 # CSIRO Biomass Regression Training (Albumentations + tqdm + MLflow)
 #
-# NEW: Auto-create folds if --splits-dir does not exist (or missing fold CSVs)
-#      using make_folds() from data_split.py.
+# Features:
+# - Auto-create folds if --splits-dir missing fold CSVs (uses make_folds from data_split.py)
+# - Supports:
+#     (A) Dinov3MultiReg (classic 5-target regression)
+#     (B) DinoV3Structured (predicts pred5 + ratio heads; uses structured_loss)
+#     (C) DinoV3Hybrid (left/right token fusion + separate heads + ratio heads; uses hybrid_loss)
+# - Logs to MLflow:
+#     * fold sizes, args, huber deltas, lambda weights
+#     * train/val fold CSVs as artifacts
+#     * per-epoch train/val loss + score
+#     * best checkpoint as artifact
 #
-# Repo layout (yours):
-# .
-# ├── scripts/
-# │   └── train.py   (this file)
-# ├── train.csv      (competition file, long format)
-# └── ... (dataset/, outputs/, mlruns/, etc.)
-#
-# Split outputs created under --splits-dir:
-#   train_fold0.csv, val_fold0.csv, ..., train_fold{k}.csv, val_fold{k}.csv
-#
-# Each fold CSV is WIDE format (one row per image) and must contain:
-#   - image_path
-#   - targets: Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g
-#   - (optional) metadata cols (State, Sampling_Date, etc.)
+# Assumptions:
+# - split CSVs are WIDE with columns:
+#   image_path + targets: Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g
 
 import argparse
 import json
@@ -35,6 +33,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from albumentations.pytorch import ToTensorV2
 from PIL import Image, ImageFile
 from torch.amp import GradScaler, autocast
@@ -42,22 +41,30 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from warnings import filterwarnings
 
-# Your project imports
 from utils import Config, set_seed
-from models.dinov3_multi_reg import Dinov3MultiReg, Dinov3Config
 
-# IMPORTANT: you said you added make_folds() to data_split.py
+# Models
+from models.dinov3_multi_reg import Dinov3MultiReg, Dinov3Config
+from models.dinov3_multi_reg_structured import DinoV3Structured, DinoV3StructuredConfig
+from models.dinov3_mamba_2_tiles import DinoV3HybridConfig, DinoV3Hybrid
+
+# Folds
 from data_split import make_folds
-import torch.nn.functional as F
 
 filterwarnings("ignore")
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 # -----------------------------
-# Dataset (Albumentations end-to-end)
+# Dataset
 # -----------------------------
 class CSIRODataset(Dataset):
+    """
+    Returns:
+      img_t: (3, H, W) where H=2S, W=4S
+      y:     (5,) in order:
+             [Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g]
+    """
     def __init__(self, df, img_dir, img_size, is_train=True, shadow_p=0.5):
         self.df = df.reset_index(drop=True)
         self.img_dir = img_dir
@@ -70,27 +77,32 @@ class CSIRODataset(Dataset):
         self.W = self.S * 4
 
         if is_train:
-            self.aug = A.Compose([
-                A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.5),
-                A.RandomShadow(
-                    shadow_roi=(0, 0, 1, 1),
-                    num_shadows_lower=1,
-                    num_shadows_upper=2,
-                    shadow_dimension=5,
-                    p=shadow_p,
-                ),
-                A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 2.0), p=0.2),
-                A.Resize(self.H, self.W),
-                A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
-                ToTensorV2(),
-            ])
+            self.aug = A.Compose(
+                [
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.RandomShadow(
+                        shadow_roi=(0, 0, 1, 1),
+                        num_shadows_lower=1,
+                        num_shadows_upper=2,
+                        shadow_dimension=5,
+                        p=shadow_p,
+                    ),
+                    A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 2.0), p=0.2),
+                    # IMPORTANT: keep Resize AFTER geometric transforms
+                    A.Resize(self.H, self.W),
+                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                    ToTensorV2(),
+                ]
+            )
         else:
-            self.aug = A.Compose([
-                A.Resize(self.H, self.W),
-                A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
-                ToTensorV2(),
-            ])
+            self.aug = A.Compose(
+                [
+                    A.Resize(self.H, self.W),
+                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                    ToTensorV2(),
+                ]
+            )
 
     def __len__(self):
         return len(self.df)
@@ -98,7 +110,10 @@ class CSIRODataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        y = torch.tensor(row[self.target5_cols].to_numpy(dtype="float32", na_value=0.0), dtype=torch.float32)  # (5,)
+        y = torch.tensor(
+            row[self.target5_cols].to_numpy(dtype="float32", na_value=0.0),
+            dtype=torch.float32,
+        )  # (5,)
 
         rel_path = str(row["image_path"])
         img_path = rel_path if os.path.isabs(rel_path) else os.path.join(self.img_dir, rel_path)
@@ -106,12 +121,13 @@ class CSIRODataset(Dataset):
         with open(img_path, "rb") as f:
             img = np.array(Image.open(f).convert("RGB"))
 
-        img_t = self.aug(image=img)["image"]   # (3,H,W)
+        img_t = self.aug(image=img)["image"]  # (3,H,W)
+
+        # safety: ensure consistent shape for stacking
         if img_t.shape[-2:] != (self.H, self.W):
             raise RuntimeError(f"Bad shape: {img_t.shape}, expected (3,{self.H},{self.W})")
 
         return img_t, y
-
 
 
 # -----------------------------
@@ -143,8 +159,102 @@ def competition_metric(preds_5: torch.Tensor, targets_5: torch.Tensor) -> float:
     return float((1.0 - ss_res / ss_tot).item())
 
 
+def structured_loss(
+    out: dict,
+    gt5: torch.Tensor,
+    huber_dead_delta: float,
+    huber_clover_delta: float,
+    lambda_ratio: float = 0.3,
+    lambda_cons: float = 0.05,
+) -> torch.Tensor:
+    """
+    out: dict from DinoV3Structured forward
+      must contain:
+        out["pred5"]             (B,5)
+        out["dead_ratio_pred"]   (B,)  in [0,1] typically
+        out["clover_ratio_pred"] (B,)  in [0,1] typically
+        out["gdm_pred"]          (B,)  optional, used in constraint here
+    """
+    green_gt = gt5[:, 0]
+    dead_gt  = gt5[:, 1]
+    clov_gt  = gt5[:, 2]
+    gdm_gt   = gt5[:, 3]
+    total_gt = gt5[:, 4]
+
+    eps = 1e-6
+    dead_ratio_gt = dead_gt / (total_gt + eps)     # Dead/Total
+    clov_ratio_gt = clov_gt / (gdm_gt + eps)       # Clover/GDM
+
+    pred5 = out["pred5"]
+    loss_main = weighted_rmse_loss(pred5, gt5)
+
+    # Huber on ratios
+    loss_dead_ratio = F.smooth_l1_loss(out["dead_ratio_pred"], dead_ratio_gt, beta=huber_dead_delta)
+    loss_clov_ratio = F.smooth_l1_loss(out["clover_ratio_pred"], clov_ratio_gt, beta=huber_clover_delta)
+
+    # Simple physical-ish constraint (optional): penalize negative predictions if any
+    gdm_pred = out.get("gdm_pred", None)
+    if gdm_pred is None:
+        loss_cons = torch.zeros((), device=gt5.device)
+    else:
+        loss_cons = F.relu(-gdm_pred).mean()
+
+    loss = loss_main + lambda_ratio * (loss_dead_ratio + loss_clov_ratio) + lambda_cons * loss_cons
+    return loss
+
+
+def hybrid_loss(
+    out: dict,
+    gt5: torch.Tensor,
+    huber_dead_delta: float,
+    huber_clover_delta: float,
+    lambda_ratio: float = 0.3,
+    lambda_cons: float = 0.05,
+    lambda_align: float = 0.02,
+) -> torch.Tensor:
+    """
+    For DinoV3Hybrid:
+      - main weighted RMSE on out["pred5"]
+      - ratio supervision (dead_ratio, clover_ratio)
+      - tiny non-neg penalty
+      - optional alignment if you expose direct heads later (safe if missing)
+    """
+    dead_gt  = gt5[:, 1]
+    clov_gt  = gt5[:, 2]
+    gdm_gt   = gt5[:, 3]
+    total_gt = gt5[:, 4]
+
+    eps = 1e-6
+    dead_ratio_gt = dead_gt / (total_gt + eps)
+    clov_ratio_gt = clov_gt / (gdm_gt + eps)
+
+    pred5 = out["pred5"]
+    loss_main = weighted_rmse_loss(pred5, gt5)
+
+    loss_dead_ratio = F.smooth_l1_loss(out["dead_ratio_pred"], dead_ratio_gt, beta=huber_dead_delta)
+    loss_clov_ratio = F.smooth_l1_loss(out["clover_ratio_pred"], clov_ratio_gt, beta=huber_clover_delta)
+
+    # small non-neg penalty (usually ~0 if your model uses softplus/recompose)
+    loss_cons = (
+        F.relu(-out["green_pred"]).mean() +
+        F.relu(-out["gdm_pred"]).mean() +
+        F.relu(-out["total_pred"]).mean() +
+        F.relu(-out["dead_pred"]).mean() +
+        F.relu(-out["clover_pred"]).mean()
+    )
+
+    # optional alignment if keys exist
+    loss_align = torch.zeros((), device=gt5.device)
+    if "dead_direct" in out and "dead_pred" in out:
+        loss_align = loss_align + F.smooth_l1_loss(out["dead_direct"], out["dead_pred"].detach(), beta=5.0)
+    if "clover_direct" in out and "clover_pred" in out:
+        loss_align = loss_align + F.smooth_l1_loss(out["clover_direct"], out["clover_pred"].detach(), beta=5.0)
+
+    return loss_main + lambda_ratio * (loss_dead_ratio + loss_clov_ratio) + lambda_cons * loss_cons + lambda_align * loss_align
+
+
 # -----------------------------
-# Train / Val loops (tqdm)
+# Train / Val loops
 # -----------------------------
 def train_one_epoch(
     model: nn.Module,
@@ -152,6 +262,11 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     scaler: Optional[GradScaler],
     device: torch.device,
+    model_name: str,
+    huber_dead_delta: float,
+    huber_clover_delta: float,
+    lambda_ratio: float,
+    lambda_cons: float,
 ) -> Tuple[float, float]:
     model.train()
     total_loss = 0.0
@@ -162,18 +277,49 @@ def train_one_epoch(
     pbar = tqdm(loader, desc="Train", leave=False, dynamic_ncols=True)
 
     for img_full_t, y in pbar:
-        img_full_t = img_full_t.to(device, non_blocking=True)  # (B,3,2S,4S)
-        y = y.to(device, non_blocking=True)  
+        img_full_t = img_full_t.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, enabled=use_amp):
-            # preds = model((left_t, right_t))
-            
-            preds = model(img_full_t)             
-            loss = weighted_rmse_loss(preds, y)
+            if model_name == "Dinov3MultiReg":
+                preds5 = model(img_full_t)  # (B,5)
+                loss = weighted_rmse_loss(preds5, y)
+                score = competition_metric(preds5.detach(), y)
 
-        score = competition_metric(preds.detach(), y)
+            elif model_name == "DinoV3Structured":
+                out = model(img_full_t)     # dict
+                loss = structured_loss(
+                    out, y,
+                    huber_dead_delta=huber_dead_delta,
+                    huber_clover_delta=huber_clover_delta,
+                    lambda_ratio=lambda_ratio,
+                    lambda_cons=lambda_cons,
+                )
+                preds5 = out["pred5"]
+                score = competition_metric(preds5.detach(), y)
+
+            elif model_name == "DinoV3Hybrid":
+                # Split full image (B,3,H,4S) -> left/right (B,3,H,2S)
+                _, _, _, W = img_full_t.shape
+                mid = W // 2
+                left = img_full_t[:, :, :, :mid]
+                right = img_full_t[:, :, :, mid:]
+
+                out = model(left, right)
+                loss = hybrid_loss(
+                    out, y,
+                    huber_dead_delta=huber_dead_delta,
+                    huber_clover_delta=huber_clover_delta,
+                    lambda_ratio=lambda_ratio,
+                    lambda_cons=lambda_cons,
+                )
+                preds5 = out["pred5"]
+                score = competition_metric(preds5.detach(), y)
+
+            else:
+                raise ValueError(f"Unknown model_name: {model_name}")
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -194,7 +340,16 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def val_one_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+def val_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    model_name: str,
+    huber_dead_delta: float,
+    huber_clover_delta: float,
+    lambda_ratio: float,
+    lambda_cons: float,
+) -> Tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_score = 0.0
@@ -202,15 +357,45 @@ def val_one_epoch(model: nn.Module, loader: DataLoader, device: torch.device) ->
 
     pbar = tqdm(loader, desc="Val", leave=False, dynamic_ncols=True)
     for img_full_t, y in pbar:
-        img_full_t = img_full_t.to(device, non_blocking=True)  # (B,3,2S,4S)
-
+        img_full_t = img_full_t.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        # preds = model((left_t, right_t))
+        if model_name == "Dinov3MultiReg":
+            preds5 = model(img_full_t)
+            loss = weighted_rmse_loss(preds5, y)
+            score = competition_metric(preds5, y)
 
-        preds = model(img_full_t)      
-        loss = weighted_rmse_loss(preds, y)
-        score = competition_metric(preds, y)
+        elif model_name == "DinoV3Structured":
+            out = model(img_full_t)
+            loss = structured_loss(
+                out, y,
+                huber_dead_delta=huber_dead_delta,
+                huber_clover_delta=huber_clover_delta,
+                lambda_ratio=lambda_ratio,
+                lambda_cons=lambda_cons,
+            )
+            preds5 = out["pred5"]
+            score = competition_metric(preds5, y)
+
+        elif model_name == "DinoV3Hybrid":
+            _, _, _, W = img_full_t.shape
+            mid = W // 2
+            left = img_full_t[:, :, :, :mid]
+            right = img_full_t[:, :, :, mid:]
+
+            out = model(left, right)
+            loss = hybrid_loss(
+                out, y,
+                huber_dead_delta=huber_dead_delta,
+                huber_clover_delta=huber_clover_delta,
+                lambda_ratio=lambda_ratio,
+                lambda_cons=lambda_cons,
+            )
+            preds5 = out["pred5"]
+            score = competition_metric(preds5, y)
+
+        else:
+            raise ValueError(f"Unknown model_name: {model_name}")
 
         bs = y.size(0)
         total_loss += loss.item() * bs
@@ -231,7 +416,6 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 # Splits utilities
 # -----------------------------
 def fold_files_exist(splits_dir: Path, n_splits: int) -> bool:
-    """Return True if all train_fold{i}.csv and val_fold{i}.csv exist."""
     for f in range(n_splits):
         if not (splits_dir / f"train_fold{f}.csv").exists():
             return False
@@ -241,16 +425,11 @@ def fold_files_exist(splits_dir: Path, n_splits: int) -> bool:
 
 
 def ensure_splits_exist(
-    repo_root: Path,
     splits_dir: Path,
     train_csv_path: Path,
     n_splits: int,
     seed: int,
 ):
-    """
-    If splits_dir doesn't exist OR fold files are missing, call make_folds(...)
-    to generate them.
-    """
     splits_dir.mkdir(parents=True, exist_ok=True)
 
     if fold_files_exist(splits_dir, n_splits):
@@ -277,22 +456,58 @@ def load_fold(splits_dir: Path, fold: int) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 # -----------------------------
+# Huber delta helpers
+# -----------------------------
+def _robust_std(x: np.ndarray) -> float:
+    """
+    Robust scale estimate: 1.4826 * median(|x - median(x)|)
+    """
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return 0.0
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    return float(1.4826 * mad)
+
+
+def auto_huber_deltas_from_train_df(train_df: pd.DataFrame) -> tuple[float, float]:
+    """
+    We need a reasonable delta for ratio Huber before training.
+    Use robust std of the ratio * 1.5 (tunable).
+    Clamp to a sensible range.
+    """
+    eps = 1e-6
+    dead = train_df["Dry_Dead_g"].to_numpy(dtype=np.float32)
+    total = train_df["Dry_Total_g"].to_numpy(dtype=np.float32)
+    gdm = train_df["GDM_g"].to_numpy(dtype=np.float32)
+    clov = train_df["Dry_Clover_g"].to_numpy(dtype=np.float32)
+
+    dead_ratio = dead / (total + eps)
+    clov_ratio = clov / (gdm + eps)
+
+    dead_scale = _robust_std(dead_ratio)
+    clov_scale = _robust_std(clov_ratio)
+
+    dead_delta = 1.5 * dead_scale
+    clov_delta = 1.5 * clov_scale
+
+    # clamp: ratios typically [0,1], deltas too tiny can make loss too L1-ish/noisy
+    dead_delta = float(np.clip(dead_delta, 0.02, 0.25))
+    clov_delta = float(np.clip(clov_delta, 0.02, 0.25))
+    return dead_delta, clov_delta
+
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="CSIRO Biomass Regression Training (auto folds)")
+    parser = argparse.ArgumentParser(description="CSIRO Biomass Regression Training (auto folds + structured + hybrid)")
     parser.add_argument("--repo-root", default=".", help="Repository root.")
     parser.add_argument("--img-dir", default=".", help="Base directory for image_path (relative paths).")
-
-    # If splits-dir does not exist OR fold CSVs missing, script will create it.
     parser.add_argument("--splits-dir", default="exps/splits", help="Directory to read/write fold CSVs.")
-
-    # train.csv (competition long-format) used ONLY when creating folds
     parser.add_argument("--train-csv", default="train.csv", help="Competition train.csv (long format).")
-
     parser.add_argument("--n-splits", type=int, default=5, help="Number of folds to create/use.")
     parser.add_argument("--no-folds", action="store_true", help="Run only fold 0.")
-
     parser.add_argument("--epochs", type=int, default=getattr(Config, "EPOCHS", 30))
     parser.add_argument("--early-stopping-patience", type=int, default=0)
 
@@ -305,9 +520,22 @@ def main():
     parser.add_argument("--img-size", type=int, default=getattr(Config, "IMG_SIZE", 512))
     parser.add_argument("--num-workers", type=int, default=getattr(Config, "NUM_WORKERS", 4))
     parser.add_argument("--pin-memory", action="store_true")
-
     parser.add_argument("--shadow-p", type=float, default=0.5, help="RandomShadow probability (train only).")
+
     parser.add_argument("--model-id", default="facebook/dinov3-vith16plus-pretrain-lvd1689m")
+
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        choices=["Dinov3MultiReg", "DinoV3Structured", "DinoV3Hybrid"],
+        default="Dinov3MultiReg",
+    )
+
+    # Structured/Hybrid ratio loss knobs
+    parser.add_argument("--huber-dead-delta", type=float, default=-1.0, help="Huber delta for dead_ratio (<=0 => auto).")
+    parser.add_argument("--huber-clover-delta", type=float, default=-1.0, help="Huber delta for clover_ratio (<=0 => auto).")
+    parser.add_argument("--lambda-ratio", type=float, default=0.3)
+    parser.add_argument("--lambda-cons", type=float, default=0.05)
 
     # MLflow
     parser.add_argument("--experiment-name", default=getattr(Config, "EXPERIMENT_NAME", "csiro_biomass"))
@@ -316,20 +544,18 @@ def main():
     # Outputs
     parser.add_argument("--output-dir", default=getattr(Config, "OUTPUT_DIR", "outputs"))
     parser.add_argument("--seed", type=int, default=getattr(Config, "SEED", 42))
-    parser.add_argument("--model-name", type=str, choices=[
-        "Dinov3MultiReg",
-    ])
+    parser.add_argument("--select-fold", type=int, default=None)
 
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
+
     img_dir = (repo_root / args.img_dir).resolve()
     splits_dir = (repo_root / args.splits_dir).resolve()
     train_csv_path = (repo_root / args.train_csv).resolve()
 
     # Ensure splits exist (create if missing)
     ensure_splits_exist(
-        repo_root=repo_root,
         splits_dir=splits_dir,
         train_csv_path=train_csv_path,
         n_splits=args.n_splits,
@@ -354,12 +580,23 @@ def main():
     mlflow.set_experiment(f"{args.experiment_name}_{timestamp}")
 
     folds_to_run = [0] if args.no_folds else list(range(args.n_splits))
+    if args.select_fold is not None:
+        folds_to_run = [args.select_fold]
 
     for fold in folds_to_run:
         train_df, val_df = load_fold(splits_dir, fold)
 
         print(f"\n========== FOLD {fold}/{len(folds_to_run)-1} ==========")
         print(f"Train size: {len(train_df)} | Val size: {len(val_df)}")
+
+        # Decide huber deltas (ratio supervision for Structured/Hybrid)
+        if args.huber_dead_delta <= 0 or args.huber_clover_delta <= 0:
+            auto_dead, auto_clov = auto_huber_deltas_from_train_df(train_df)
+        else:
+            auto_dead, auto_clov = None, None
+
+        huber_dead_delta = float(auto_dead if args.huber_dead_delta <= 0 else args.huber_dead_delta)
+        huber_clover_delta = float(auto_clov if args.huber_clover_delta <= 0 else args.huber_clover_delta)
 
         train_ds = CSIRODataset(
             train_df,
@@ -393,13 +630,23 @@ def main():
             drop_last=False,
         )
 
+        # Build model
         if args.model_name == "Dinov3MultiReg":
             cfg = Dinov3Config(model_id=args.model_id, patch_size=16)
             model = Dinov3MultiReg(cfg).to(device)
-        else:
-            raise Exception("Unknown model name: ", args.model_name)
 
-        # optimizer only trainable params (encoder is frozen inside model)
+        elif args.model_name == "DinoV3Structured":
+            cfg = DinoV3StructuredConfig(model_id=args.model_id)
+            model = DinoV3Structured(cfg).to(device)
+
+        elif args.model_name == "DinoV3Hybrid":
+            cfg = DinoV3HybridConfig(model_id=args.model_id)
+            model = DinoV3Hybrid(cfg).to(device)
+
+        else:
+            raise ValueError(f"Unknown model name: {args.model_name}")
+
+        # optimizer only trainable params (encoder may be frozen inside model)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -426,14 +673,25 @@ def main():
 
         best_score = -1e18
         epochs_since_best = 0
-        best_ckpt_path = run_out_dir / f"dinov3_reg_fold{fold}.pt"
+        best_ckpt_path = run_out_dir / f"{args.model_name}_fold{fold}.pt"
         history = []
+
+        # Save fold CSVs for this run (and log to MLflow)
+        fold_train_csv = run_out_dir / f"train_fold{fold}.csv"
+        fold_val_csv = run_out_dir / f"val_fold{fold}.csv"
+        train_df.to_csv(fold_train_csv, index=False)
+        val_df.to_csv(fold_val_csv, index=False)
 
         with mlflow.start_run(run_name=f"fold_{fold}"):
             mlflow.log_artifact(str(run_out_dir / "cli_args.json"))
+            mlflow.log_artifact(str(fold_train_csv), artifact_path=f"fold_{fold}_data")
+            mlflow.log_artifact(str(fold_val_csv), artifact_path=f"fold_{fold}_data")
+
             mlflow.log_params(
                 {
                     "fold": fold,
+                    "train_rows": int(len(train_df)),
+                    "val_rows": int(len(val_df)),
                     "epochs": args.epochs,
                     "batch_size": args.batch_size,
                     "lr": args.lr,
@@ -441,15 +699,20 @@ def main():
                     "lr_scheduler": args.lr_scheduler,
                     "warmup_epochs": args.warmup_epochs,
                     "early_stopping_patience": args.early_stopping_patience,
-                    "img_size_half": args.img_size,
-                    "full_resize": f"{args.img_size}x{args.img_size*2}",
+                    "img_size_S": args.img_size,
+                    "full_resize": f"{args.img_size*2}x{args.img_size*4}",
                     "shadow_p": args.shadow_p,
                     "model_id": args.model_id,
                     "seed": args.seed,
                     "device": device.type,
-                    "frozen_backbone": True,
                     "splits_dir": str(splits_dir),
                     "train_csv_for_splits": str(train_csv_path),
+                    # ratio knobs (logged even if not used by MultiReg)
+                    "huber_dead_delta": huber_dead_delta,
+                    "huber_clover_delta": huber_clover_delta,
+                    "lambda_ratio": args.lambda_ratio,
+                    "lambda_cons": args.lambda_cons,
+                    "model_name": args.model_name,
                 }
             )
 
@@ -461,8 +724,28 @@ def main():
                     warmup_lr = args.lr * (epoch / warmup_epochs)
                     set_optimizer_lr(optimizer, warmup_lr)
 
-                train_loss, train_score = train_one_epoch(model, train_loader, optimizer, scaler, device)
-                val_loss, val_score = val_one_epoch(model, val_loader, device)
+                train_loss, train_score = train_one_epoch(
+                    model=model,
+                    loader=train_loader,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    device=device,
+                    model_name=args.model_name,
+                    huber_dead_delta=huber_dead_delta,
+                    huber_clover_delta=huber_clover_delta,
+                    lambda_ratio=args.lambda_ratio,
+                    lambda_cons=args.lambda_cons,
+                )
+                val_loss, val_score = val_one_epoch(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    model_name=args.model_name,
+                    huber_dead_delta=huber_dead_delta,
+                    huber_clover_delta=huber_clover_delta,
+                    lambda_ratio=args.lambda_ratio,
+                    lambda_cons=args.lambda_cons,
+                )
 
                 # scheduler steps
                 if args.lr_scheduler == "onecycle" and scheduler is not None:
@@ -489,6 +772,7 @@ def main():
                     },
                     step=epoch,
                 )
+
                 print(
                     f"[Fold {fold:02d}] "
                     f"Epoch {epoch:03d}/{args.epochs:03d} | "
@@ -514,7 +798,18 @@ def main():
                     best_score = val_score
                     epochs_since_best = 0
                     torch.save(
-                        {"model_state": model.state_dict(), "epoch": epoch, "best_val_score": best_score},
+                        {
+                            "model_state": model.state_dict(),
+                            "epoch": epoch,
+                            "best_val_score": float(best_score),
+                            "model_name": args.model_name,
+                            "model_id": args.model_id,
+                            "img_size_S": args.img_size,
+                            "huber_dead_delta": huber_dead_delta,
+                            "huber_clover_delta": huber_clover_delta,
+                            "lambda_ratio": args.lambda_ratio,
+                            "lambda_cons": args.lambda_cons,
+                        },
                         best_ckpt_path,
                     )
                     print(f"[Fold {fold:02d}] 🎉 New best val_score={val_score:.4f} at epoch {epoch}. Saving checkpoint.")

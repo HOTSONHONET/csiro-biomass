@@ -4,5 +4,10 @@ mlruns
 train
 test
 outputs
+inference
+outputs_classical/
+oof/
+calibration
+mlartifacts/
 
 *__pycache__*
