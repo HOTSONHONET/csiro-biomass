@@ -153,99 +153,47 @@ graph TD
 
 ```
 
+## ⚖️ Mass Balance Projection Math
+
+We enforce physical consistency by ensuring the predicted biomass components satisfy the law of mass conservation. Given a raw prediction vector $\mathbf{x} \in \mathbb{R}^5$ in the order $[\text{Green}, \text{Clover}, \text{Dead}, \text{GDM}, \text{Total}]$, we define two linear constraints:
+
+
+
+1. GDM Balance: $\text{Green} + \text{Clover} - \text{GDM} = 0$
+
+2. Total Balance: $\text{Dead} + \text{GDM} - \text{Total} = 0$
+
+
+This system is represented as $A\mathbf{x} = 0$, where the constraint matrix $A$ is:
+
+$$A = \begin{bmatrix}
+1 & 1 & 0 & -1 & 0 \
+0 & 0 & 1 & 1 & -1
+\end{bmatrix}$$
+
+
+To find the corrected vector $\mathbf{x}'$ that is closest to our initial prediction $\mathbf{x}$ (minimizing the $L_2$ distance $\|\mathbf{x}' - \mathbf{x}\|^2$), we use the orthogonal projection onto the null space of $A$:
+
+
+$$\mathbf{x}' = \mathbf{x} - A^T (AA^T)^{-1} (A\mathbf{x})$$
+
+Where:
+
+- $(A\mathbf{x})$ is the residual vector (the "error" in the physical laws).
+- $(AA^T)^{-1}$ is the inverse of the constraint covariance.
+- The final result $\mathbf{x}'$ is guaranteed to satisfy $A\mathbf{x}' = 0$, ensuring perfect physical alignment across all five predicted targets.
+
+
 
 ## Final Submission
 
-```mermaid
+- The final solution is a hierarchical ensemble combining a **Deep Learning Hybrid (DINOv3 + Mamba)** and a **Classical Feature-Based Ensemble**, both constrained by biomass physics.
 
-graph TD
-    %% Global Input
-    Start([Input Crop Image]) --> PreProc{Pre-processing}
+![CSIRO Biomass Inference Pipeline](./assets/csiro-final-submisison-flow.png)
 
-    %% PIPELINE A: NN BRANCH
-    subgraph Pipeline_A [Pipeline A: DinoV3 Hybrid NN]
-        PreProc --> Split[Split: Left & Right]
-        Split --> B1[DINOv3 ViT - Left]
-        Split --> B2[DINOv3 ViT - Right]
-        B1 & B2 --> Cat[Concatenate Tokens]
-        Cat --> Mamba[Local Mamba Blocks]
-        Mamba --> Pool[Adaptive Avg Pool]
-        
-        subgraph NN_Heads [7 Regression & Ratio Heads]
-            Pool --> H1[Green]
-            Pool --> H2[GDM]
-            Pool --> H3[Total]
-            Pool --> H4[Dead]
-            Pool --> H5[Clover]
-            Pool --> R1[Dead Ratio]
-            Pool --> R2[Clover Ratio]
-        end
-
-        subgraph NN_Logic [Hybrid Physical Constraints]
-            H4 & H5 --> Direct[Direct Preds]
-            H3 & H2 --> D1[Dead: Total - GDM]
-            R1 & H3 --> D2[Dead: Ratio * Total]
-            H2 & H1 --> D3[Clover: GDM - Green]
-            R2 & H2 --> D4[Clover: Ratio * GDM]
-            
-            D1 & D2 --> DeadAvg[Avg Dead Derived]
-            D3 & D4 --> ClovAvg[Avg Clover Derived]
-            
-            Direct -- Mix Logit --> FinalDead[Final Dead]
-            DeadAvg -- Mix Logit --> FinalDead
-            Direct -- Mix Logit --> FinalClov[Final Clover]
-            ClovAvg -- Mix Logit --> FinalClov
-            
-            FinalClov --> FinalGDM_A[GDM: Green + Clover]
-            FinalDead --> FinalTotal_A[Total: GDM + Dead]
-            H1 --> FinalGreen_A[Green]
-        end
-        
-        FinalGreen_A & FinalDead & FinalClov & FinalGDM_A & FinalTotal_A --> SUB_A[[Submission DF 1]]
-    end
-
-    %% PIPELINE B: CLASSICAL BRANCH
-    subgraph Pipeline_B [Pipeline B: DinoV3 + Classical Ensemble]
-        PreProc --> DTransform[DINOv3 Transform]
-        DTransform --> DBackbone[DINOv3 Backbone: CLS Token]
-        DBackbone --> Embed[Embeddings Vector X]
-        
-        subgraph ClassicalModels [Parallel Models]
-            Embed --> M1[Ridge: Scaler + PCA-64]
-            Embed --> M2[ElasticNet: Scaler + PCA-64]
-            Embed --> M3[Linear: Scaler + PCA-64]
-        end
-        
-        M1 & M2 & M3 --> Weight[Weighted Ensemble: CV Scores]
-        
-        subgraph PostProcessing [Mass Balance & Physics]
-            Weight --> Clip1[Clip Negatives]
-            Clip1 --> MB[Mass Balance Projection]
-            MB -.-> Eq1[Green + Clover = GDM]
-            MB -.-> Eq2[GDM + Dead = Total]
-            MB --> Clip2[Final Non-Negative Clip]
-        end
-        
-        Clip2 --> SUB_B[[Submission DF 2]]
-    end
-
-    %% FINAL ENSEMBLE
-    subgraph GrandEnsemble [Final Weighted Ensemble]
-        SUB_A -- "0.65 Weight" --> Merge{Weighted Sum}
-        SUB_B -- "0.35 Weight" --> Merge
-        
-        Merge --> Align[Inner Join: sample_id]
-        Align --> Calc[Target = M0*0.65 + M1*0.35]
-        Calc --> Float32[Cast to Float32]
-    end
-
-    Float32 --> FinalOut[/final_submission.csv/]
-
-    %% Styling
-    style GrandEnsemble fill:#fff9c4,stroke:#fbc02d
-    style Pipeline_A fill:#e1f5fe,stroke:#01579b
-    style Pipeline_B fill:#f3e5f5,stroke:#4a148c
-    style MB fill:#f96,stroke:#333
-
-
-```
+-  🚀 Pipeline Breakdown
+    1. **Pipeline A (Neural Network):** Uses a Stereo-split DINOv3 backbone fused with **Local Mamba Blocks** to capture spatial context. It employs a "Mix Logit" head to blend direct regression with derived ratios.
+    2. **Pipeline B (Classical):** Extracts fixed DINOv3 CLS embeddings, reduces dimensionality via **PCA-64**, and ensembles Ridge, ElasticNet, and Linear models.
+    3. **Mass Balance Projection:** Final predictions are projected onto a subspace that satisfies:
+        - $Dry\_Green\_g + Dry\_Clover\_g = GDM\_g$
+        - $GDM\_g + Dry\_Dead\_g = Dry\_Total\_g$
