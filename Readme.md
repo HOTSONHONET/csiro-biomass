@@ -195,5 +195,5 @@ Where:
     1. **Pipeline A (Neural Network):** Uses a Stereo-split DINOv3 backbone fused with **Local Mamba Blocks** to capture spatial context. It employs a "Mix Logit" head to blend direct regression with derived ratios.
     2. **Pipeline B (Classical):** Extracts fixed DINOv3 CLS embeddings, reduces dimensionality via **PCA-64**, and ensembles Ridge, ElasticNet, and Linear models.
     3. **Mass Balance Projection:** Final predictions are projected onto a subspace that satisfies:
-        - $Dry\_Green\_g + Dry\_Clover\_g = GDM\_g$
-        - $GDM\_g + Dry\_Dead\_g = Dry\_Total\_g$
+        - $DryGreen\_g + DryClover\_g = GDM\_g$
+        - $GDM\_g + DryDead\_g = DryTotal\_g$
